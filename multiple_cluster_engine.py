@@ -1,11 +1,12 @@
-import time
-import os
 import ipyparallel as ipp
 from collections import defaultdict
-from tqdm import tqdm
-import itertools
+import os
+import psutil
+import time
 from datetime import datetime
+from tqdm import tqdm
 import copy
+import itertools
 
 import logging # logging can create duplicate entries if you don't reload logging
 try:
@@ -14,7 +15,13 @@ except: # Python 2 reload is a builtin
     pass
 
 class MultipleClusterEngine(object):
-    def __init__(self, cluster_job_name, n_cpus_list, input_file_names, output_parent_dir, function_to_process, function_kwargs_dict): # always put it in as a dictionary
+    def __init__(self, 
+                 cluster_job_name, 
+                 n_cpus_list, 
+                 input_file_names,
+                 output_parent_dir,
+                 function_to_process,
+                 function_kwargs_dict): # always put function args in a dictionary
         reload(logging)
         self.cluster_job_name = cluster_job_name
         self.n_cpus_list = n_cpus_list
@@ -39,6 +46,7 @@ class MultipleClusterEngine(object):
         self.start_time = None
         self.end_time = None
         self.cluster_output_dir = None
+        self.cluster_RAM_use_dict = {}
 
     def create_cluster_output_dir(self):
         subdirs = [name for name in os.listdir(self.output_parent_dir) if 
@@ -50,7 +58,8 @@ class MultipleClusterEngine(object):
             except ValueError:
                 pass
         dir_index = max(existing_results_dir) + 1 if existing_results_dir else 0
-        self.cluster_output_dir = os.path.join(self.output_parent_dir, self.cluster_job_name + str(dir_index))
+        self.cluster_output_dir = os.path.join(self.output_parent_dir, 
+                                               self.cluster_job_name + str(dir_index))
         os.makedirs(self.cluster_output_dir)
                 
     def create_logger(self, logger_name, log_file):
@@ -62,13 +71,35 @@ class MultipleClusterEngine(object):
     def activate_logger(self):
         self.create_logger('status', os.path.join(self.cluster_output_dir, "status.log"))
         self.create_logger('failure', os.path.join(self.cluster_output_dir, "failure.log"))
+        self.create_logger('ram_usage', os.path.join(self.cluster_output_dir, "ram_usage.log"))
         self.logger_status = logging.getLogger('status')
         self.logger_status.propagate = False
         self.logger_failure = logging.getLogger('failure')
         self.logger_failure.propagate = False
+        self.logger_ram_usage = logging.getLogger('ram_usage')
+        self.logger_ram_usage.propagate = False
+        
+    def profile_memory_for_cluster(self, jth_cluster): # RAM in GB
+        cluster_pids = self.client_dict[jth_cluster][:].apply_async(os.getpid).get()
+        return sum(psutil.Process(pid).memory_info().rss for pid in cluster_pids) / 1e9
+        
+    def profile_memory_for_all_clusters(self):
+        self.cluster_RAM_use_dict.clear()
+        for jth_cluster in sorted(self.load_balanced_view_dict):
+            self.cluster_RAM_use_dict[jth_cluster] = self.profile_memory_for_cluster(jth_cluster)           
+            self.logger_ram_usage.info('{}: {}th cluster uses {} GB of RAM'.format(
+                datetime.now(), jth_cluster, self.cluster_RAM_use_dict[jth_cluster]))
+        self.logger_ram_usage.info('{}: All clusters uses {} GB of RAM'.format(
+                datetime.now(), sum(self.cluster_RAM_use_dict.values())))
+        # if all clusters are dead, then raise Error with a message
+            
+    def early_kill_cluster(self, jth_cluster):
+        pass
+        
     
     def start_cluster(self, n_cpus, cluster_id):
-        self.logger_status.info("\tAttempting to start cluster job {}'s {}th cluster with {} CPUs".format(self.cluster_job_name, cluster_id, n_cpus))
+        self.logger_status.info("\tAttempting to start cluster job "
+                "{}'s {}th cluster with {} CPUs".format(self.cluster_job_name, cluster_id, n_cpus))
         os.system("ipcluster start --n={} --profile={}{} --daemonize".format(
             n_cpus, self.cluster_job_name, cluster_id)) # should deprecate to use a safer bash call
 
@@ -80,7 +111,8 @@ class MultipleClusterEngine(object):
             except ipp.error.TimeoutError:
                 attempt_ctr += 1
             else:
-                self.logger_status.info('\t\tCPU processes ready for action: {}'.format(client[:].apply_async(os.getpid).get()))
+                self.logger_status.info('\t\tCPU processes ready for action: {}'.format(
+                    client[:].apply_async(os.getpid).get()))
                 return client
             # if there is any other error other than TimeoutError, then the error will be raised
             
@@ -96,7 +128,6 @@ class MultipleClusterEngine(object):
         self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
         
     def kill_cluster(self, cluster_id): # use better arguments
-        # client = client_list[cluster_id]
         self.logger_status.info('\tAttempting to kill {}{} with CPU processes: {}'.format(
             self.cluster_job_name, cluster_id, self.client_dict[cluster_id][:].apply_async(os.getpid).get()))
         self.load_balanced_view_dict.pop(cluster_id)
@@ -145,12 +176,11 @@ class MultipleClusterEngine(object):
         
         for ith_file in tqdm(range(len(self.input_file_names))):
             for jth_cluster in self.cluster_indexes: # infinite loop
-                time.sleep(1) # hard coded delay time; want to do expected log time lag / number of clusters
-                ### insert code here to kill cluster if RAM usage too great, if possible log which file it was processing;
-                ### it has to do a global search of all clusters' RAM usage
-                ### would need a dictionary here to remember which cluster has which file; write to disk
-                ### profiler would also write to disk CPU usage what level
-
+                time.sleep(1) # hard coded delay time; want to do expected log time lag
+                ### insert code here to kill cluster if RAM usage too great, 
+                ###       if possible log which file it was processing;
+                self.profile_memory_for_all_clusters()                
+                
                 if (not self.async_results_dict[jth_cluster][-1:] 
                     or self.async_results_dict[jth_cluster][-1].done()): # check if cluster i is available                       
                     # if necessary, recreate engine here if cluster shut down
@@ -169,24 +199,18 @@ class MultipleClusterEngine(object):
                         jth_cluster, 
                         len(self.client_dict[jth_cluster].ids))                    
                     
-                    ### insert code to write results to file--it will only have start times, no end times
                     async_result = self.load_balanced_view_dict[jth_cluster].map_async(
-                        self.function_to_process, # function name
-                        kwargs_dict_list
-#                            [self.input_file_names[index]] * len(self.client_dict[jth_cluster].ids), # file name, assumes first argument is always file name
-                            # [len(client_list[i].ids)] * len(client_list[i].ids), # number of CPUs, assumes second argument is always number of CPUs
-                            #  client_list[i].ids # CPU ids, assumes third argument is always CPU id; actually turn into kwargs
-                             # [output_folder_name] * len(client_list[i].ids) # assumes fourth argument is output directory
-#                            [self.function_kwargs_dict] * len(self.client_dict[jth_cluster].ids)                    
-                    #        [function_kwargs_dict] * len(self.client_dict[jth_cluster].ids)                    
-                            )                                              
+                        self.function_to_process, kwargs_dict_list)                                              
                     self.async_results_dict[jth_cluster].append(async_result)
                     self.file_to_cluster_order_dict[jth_cluster].append(self.input_file_names[index])
-                    self.logger_status.info("{} is the {}th file and is sent to {}th cluster for processing".format(
+                    # write status to file--it will only have start times, no end times
+                    self.logger_status.info(("{} is the {}th file and is sent to "
+                        "{}th cluster for processing").format(
                         self.input_file_names[index], ith_file, jth_cluster))
                     break # break out of inner loop to determine if other clusters are available
 
-        while not all(self.async_results_dict[jth_cluster][-1].done() for jth_cluster in self.async_results_dict): # wait for all clusters to finish
+        while not all(self.async_results_dict[jth_cluster][-1].done()
+                      for jth_cluster in self.async_results_dict): # wait for all clusters to finish
             time.sleep(1)
             
         cluster_set = set()
