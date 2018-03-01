@@ -49,6 +49,7 @@ class MultipleClusterEngine(object):
         self.end_time = None
         self.cluster_output_dir = None
         self.cluster_RAM_use_dict = {}
+        self.cluster_pid_dict = {}
 
     def create_cluster_output_dir(self):
         subdirs = [name for name in os.listdir(self.output_parent_dir) if 
@@ -82,8 +83,7 @@ class MultipleClusterEngine(object):
         self.logger_ram_usage.propagate = False
         
     def profile_memory_for_cluster(self, cluster_id): # RAM in GB
-        cluster_pids = self.client_dict[cluster_id][:].apply_async(os.getpid).get()
-        return sum(psutil.Process(pid).memory_info().rss for pid in cluster_pids) / 1e9
+        return sum(psutil.Process(pid).memory_info().rss for pid in self.cluster_pid_dict[cluster_id]) / 1e9
         
     def profile_memory_for_all_clusters(self):
         self.cluster_RAM_use_dict.clear()
@@ -112,8 +112,9 @@ class MultipleClusterEngine(object):
             except ipp.error.TimeoutError:
                 attempt_ctr += 1
             else:
+                self.cluster_pid_dict[cluster_id] = client[:].apply_async(os.getpid).get()
                 self.logger_status.info('\t\tCPU processes ready for action: {}'.format(
-                    client[:].apply_async(os.getpid).get()))
+                    self.cluster_pid_dict[cluster_id]))
                 return client
             # if there is any other error other than TimeoutError, then the error will be raised
             
@@ -130,44 +131,47 @@ class MultipleClusterEngine(object):
         
     def kill_cluster(self, cluster_id): # use better arguments
         self.logger_status.info('\tAttempting to kill {}{} with CPU processes: {}'.format(
-            self.cluster_job_name, cluster_id, self.client_dict[cluster_id][:].apply_async(os.getpid).get()))
+            self.cluster_job_name, cluster_id, self.cluster_pid_dict[cluster_id]))
         self.load_balanced_view_dict.pop(cluster_id)
         # client.purge_everything()
         self.client_dict[cluster_id].close()
         self.client_dict.pop(cluster_id)
         os.system('ipcluster stop --profile={}{}'.format(self.cluster_job_name, cluster_id))
         self.logger_status.info('\t\tCluster successfully killed')
+        self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
         time.sleep(5) # hard-coded
-        # have to mutate cluster_indexes
         
     def kill_all_clusters(self):
         self.end_time = datetime.now()
+        n_surviving_clusters = len(self.client_dict)
         self.logger_status.info('Killing all clusters')
         for cluster_id in sorted(self.client_dict):
             self.kill_cluster(cluster_id)
         self.logger_status.info('All clusters have been killed')
         self.logger_status.info('Multiple Cluster Engine shut down at {}'.format(self.end_time))
-        self.logger_status.info('Processed {} files in {} minutes'.format(
-            len(self.input_file_names), (self.end_time - self.start_time).seconds / 60.0))
+        self.logger_status.info('Processed {} files using {} surviving clusters in {} minutes'.format(
+            len(self.input_file_names), n_surviving_clusters, (self.end_time - self.start_time).seconds / 60.0))
         logging.shutdown()
         
     def early_kill_cluster(self, cluster_id):
         self.logger_failure.info(('Killing {}{} which was processing file {} '
             'due to exceeding RAM limit').format(self.cluster_job_name, 
-             cluster_id, self.file_to_cluster_order_dict[cluster_id]))
+             cluster_id, self.file_to_cluster_order_dict[cluster_id][-1]))
+        self.client_dict[cluster_id].close()
         os.system('ipcluster stop --profile={}{}'.format(self.cluster_job_name, cluster_id))
         self.load_balanced_view_dict.pop(cluster_id)
-        self.client_dict[cluster_id].close()
         self.client_dict.pop(cluster_id)
-        time.sleep(5)
+        self.async_results_dict.pop(jth_cluster)
         
-    def kill_cluster_if_ram_limit_exceeded(self):
-        # only kills at max 1 cluster per method call
+    def kill_cluster_if_ram_limit_exceeded(self): # only kills at max 1 cluster per method call
+        print('function kill_cluster_if_ram_limit_exceeded called')
+        print(self.cluster_RAM_use_dict.values(), self.ram_limit_in_GB)
         if sum(self.cluster_RAM_use_dict.values()) > self.ram_limit_in_GB:
             cluster_id = sorted(self.cluster_RAM_use_dict, 
                                  key=self.cluster_RAM_use_dict.get, reverse=True)[0]
             self.early_kill_cluster(cluster_id)
-        self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
+            print('killing cluster{}'.format(cluster_id))
+            self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
         assert len(self.load_balanced_view_dict) != 0, 'All clusters have been killed prematurely'
         
     def create_kwargs_dict_list(self, input_file_name, cluster_id, n_cpus):
@@ -182,7 +186,7 @@ class MultipleClusterEngine(object):
             function_kwargs_dict_list[cpu_id]['cpu_id'] = cpu_id
         return function_kwargs_dict_list 
     
-    def check_if_function_in_cluster_failured(self, jth_cluster):
+    def check_if_function_in_cluster_failed(self, jth_cluster):
         if self.async_results_dict[jth_cluster] == []: # cluster just started, so it
             return # doesn't have any files sent to the cluster yet
         else:
@@ -190,22 +194,25 @@ class MultipleClusterEngine(object):
             if exception:
                 self.logger_failure.info('{}th cluster has error {} on file {}'.format(
                     jth_cluster, exception.args[0], self.file_to_cluster_order_dict[jth_cluster][-1]))
+            self.async_results_dict.pop(jth_cluster)
                                      
     def run_clusters(self):
         small_file_ctr = 1 # determine if you want to have queue or differently ordered queue
         big_file_ctr = 0
         
         for ith_file in tqdm(range(len(self.input_file_names))):
-            for jth_cluster in self.cluster_indexes: # infinite loop
+            while True:
+                # for jth_cluster in self.cluster_indexes: # infinite loop
                 time.sleep(1) # hard coded delay time; want to do expected log time lag
                 ### insert code here to kill cluster if RAM usage too great, 
                 self.profile_memory_for_all_clusters()
                 self.kill_cluster_if_ram_limit_exceeded()
+                jth_cluster = next(self.cluster_indexes)
                 
-                if (not self.async_results_dict[jth_cluster][-1:] 
+                if (not self.async_results_dict[jth_cluster][-1:]
                     or self.async_results_dict[jth_cluster][-1].done()): # check if cluster i is available                       
                     self.clear_memory_on_cluster(jth_cluster)
-                    self.check_if_function_in_cluster_failured(jth_cluster) # check if previous file failed to process
+                    self.check_if_function_in_cluster_failed(jth_cluster) # check if previous file failed to process
                     
                     if jth_cluster == 0: # Send large files to large cluster (ALWAYS has id == 0)
                         index = big_file_ctr
@@ -231,14 +238,17 @@ class MultipleClusterEngine(object):
 
         while not all(self.async_results_dict[jth_cluster][-1].done()
                       for jth_cluster in self.async_results_dict): # wait for all clusters to finish
-            time.sleep(1)
-            
+            time.sleep(1) # hard coded wait time
+            self.profile_memory_for_all_clusters()
+            self.kill_cluster_if_ram_limit_exceeded()
+            print('ending of while loop body')
+                
         cluster_set = set()
         for jth_cluster in self.cluster_indexes:
             if jth_cluster in cluster_set:
                 break
             cluster_set.add(jth_cluster)
-            self.check_if_function_in_cluster_failured(jth_cluster)
+            self.check_if_function_in_cluster_failed(jth_cluster) # check if last file failed to process
         # async_results_dict; save to disk for later inspection?
         # take a look at whether the results cache takes too much RAM
         
