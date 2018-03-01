@@ -38,7 +38,7 @@ class MultipleClusterEngine(object):
         assert len(self.input_file_names) > 0, "Need input files"
 
         # used by engine
-        self.client_dict = {}
+        self.cluster_dict = {}
         self.load_balanced_view_dict = {}
         self.async_results_dict = defaultdict(list) # collects all the async_results
         self.file_to_cluster_order_dict = defaultdict(list) # remembers which file is sent to which cluster
@@ -94,9 +94,9 @@ class MultipleClusterEngine(object):
         self.logger_ram_usage.info('{}: All clusters uses {} GB of RAM'.format(
                 datetime.now(), sum(self.cluster_RAM_use_dict.values())))
         
-    def clear_memory_on_cluster(self, cluster_id):
+    def clear_memory_on_cluster(self, cluster_id): # not as effective as imagined
         import gc
-        self.client_dict[cluster_id][:].apply_async(gc.collect)
+        self.cluster_dict[cluster_id][:].apply_async(gc.collect)
         
     def start_cluster(self, n_cpus, cluster_id):
         self.logger_status.info("\tAttempting to start cluster job "
@@ -108,14 +108,14 @@ class MultipleClusterEngine(object):
         while attempt_ctr < 3: # Attempt to connect to client 3 times
             time.sleep(10) # hard coded
             try:
-                client = ipp.Client(profile='{}{}'.format(self.cluster_job_name, cluster_id))
+                cluster = ipp.Client(profile='{}{}'.format(self.cluster_job_name, cluster_id))
             except ipp.error.TimeoutError:
                 attempt_ctr += 1
             else:
-                self.cluster_pid_dict[cluster_id] = client[:].apply_async(os.getpid).get()
+                self.cluster_pid_dict[cluster_id] = cluster[:].apply_async(os.getpid).get()
                 self.logger_status.info('\t\tCPU processes ready for action: {}'.format(
                     self.cluster_pid_dict[cluster_id]))
-                return client
+                return cluster
             # if there is any other error other than TimeoutError, then the error will be raised
             
     def start_all_clusters(self):
@@ -123,8 +123,8 @@ class MultipleClusterEngine(object):
         self.logger_status.info('Starting Multiple Cluster Engine')
         #self.logger_status.info('Attempting to start all clusters')
         for cluster_id, n_cpus in enumerate(self.n_cpus_list):
-            self.client_dict[cluster_id] = self.start_cluster(n_cpus, cluster_id)
-            self.load_balanced_view_dict[cluster_id] = self.client_dict[cluster_id].load_balanced_view()            
+            self.cluster_dict[cluster_id] = self.start_cluster(n_cpus, cluster_id)
+            self.load_balanced_view_dict[cluster_id] = self.cluster_dict[cluster_id].load_balanced_view()            
         self.start_time = datetime.now()
         self.logger_status.info('All clusters started at {}'.format(self.start_time))
         self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
@@ -133,9 +133,9 @@ class MultipleClusterEngine(object):
         self.logger_status.info('\tAttempting to kill {}{} with CPU processes: {}'.format(
             self.cluster_job_name, cluster_id, self.cluster_pid_dict[cluster_id]))
         self.load_balanced_view_dict.pop(cluster_id)
-        # client.purge_everything()
-        self.client_dict[cluster_id].close()
-        self.client_dict.pop(cluster_id)
+        # cluster.purge_everything()
+        self.cluster_dict[cluster_id].close()
+        self.cluster_dict.pop(cluster_id)
         os.system('ipcluster stop --profile={}{}'.format(self.cluster_job_name, cluster_id))
         self.logger_status.info('\t\tCluster successfully killed')
         self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
@@ -143,9 +143,9 @@ class MultipleClusterEngine(object):
         
     def kill_all_clusters(self):
         self.end_time = datetime.now()
-        n_surviving_clusters = len(self.client_dict)
+        n_surviving_clusters = len(self.cluster_dict)
         self.logger_status.info('Killing all clusters')
-        for cluster_id in sorted(self.client_dict):
+        for cluster_id in sorted(self.cluster_dict):
             self.kill_cluster(cluster_id)
         self.logger_status.info('All clusters have been killed')
         self.logger_status.info('Multiple Cluster Engine shut down at {}'.format(self.end_time))
@@ -157,20 +157,17 @@ class MultipleClusterEngine(object):
         self.logger_failure.info(('Killing {}{} which was processing file {} '
             'due to exceeding RAM limit').format(self.cluster_job_name, 
              cluster_id, self.file_to_cluster_order_dict[cluster_id][-1]))
-        self.client_dict[cluster_id].close()
+        self.cluster_dict[cluster_id].close()
         os.system('ipcluster stop --profile={}{}'.format(self.cluster_job_name, cluster_id))
         self.load_balanced_view_dict.pop(cluster_id)
-        self.client_dict.pop(cluster_id)
-        self.async_results_dict.pop(jth_cluster)
+        self.cluster_dict.pop(cluster_id)
+        self.async_results_dict.pop(cluster_id)
         
     def kill_cluster_if_ram_limit_exceeded(self): # only kills at max 1 cluster per method call
-        print('function kill_cluster_if_ram_limit_exceeded called')
-        print(self.cluster_RAM_use_dict.values(), self.ram_limit_in_GB)
         if sum(self.cluster_RAM_use_dict.values()) > self.ram_limit_in_GB:
             cluster_id = sorted(self.cluster_RAM_use_dict, 
                                  key=self.cluster_RAM_use_dict.get, reverse=True)[0]
             self.early_kill_cluster(cluster_id)
-            print('killing cluster{}'.format(cluster_id))
             self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
         assert len(self.load_balanced_view_dict) != 0, 'All clusters have been killed prematurely'
         
@@ -194,7 +191,7 @@ class MultipleClusterEngine(object):
             if exception:
                 self.logger_failure.info('{}th cluster has error {} on file {}'.format(
                     jth_cluster, exception.args[0], self.file_to_cluster_order_dict[jth_cluster][-1]))
-            self.async_results_dict.pop(jth_cluster)
+                self.async_results_dict.pop(jth_cluster)
                                      
     def run_clusters(self):
         small_file_ctr = 1 # determine if you want to have queue or differently ordered queue
@@ -224,7 +221,7 @@ class MultipleClusterEngine(object):
                     kwargs_dict_list = self.create_kwargs_dict_list(
                         self.input_file_names[index],
                         jth_cluster, 
-                        len(self.client_dict[jth_cluster].ids))                    
+                        len(self.cluster_dict[jth_cluster].ids))                    
                     
                     async_result = self.load_balanced_view_dict[jth_cluster].map_async(
                         self.function_to_process, kwargs_dict_list)                                              
@@ -241,7 +238,6 @@ class MultipleClusterEngine(object):
             time.sleep(1) # hard coded wait time
             self.profile_memory_for_all_clusters()
             self.kill_cluster_if_ram_limit_exceeded()
-            print('ending of while loop body')
                 
         cluster_set = set()
         for jth_cluster in self.cluster_indexes:
@@ -249,8 +245,7 @@ class MultipleClusterEngine(object):
                 break
             cluster_set.add(jth_cluster)
             self.check_if_function_in_cluster_failed(jth_cluster) # check if last file failed to process
-        # async_results_dict; save to disk for later inspection?
-        # take a look at whether the results cache takes too much RAM
+        # async_results_dict; save to disk for later inspection? determine whether results takes too much RAM
         
     def main(self):
         self.create_cluster_output_dir()
