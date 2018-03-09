@@ -52,6 +52,7 @@ class MultipleClusterEngine(object):
         self.cluster_output_dir = None
         self.cluster_RAM_use_dict = {}
         self.cluster_pid_dict = {}
+        self.n_unsuccessful_files = 0
 
     def create_cluster_output_dir(self):
         subdirs = [name for name in os.listdir(self.output_parent_dir) if 
@@ -149,14 +150,15 @@ class MultipleClusterEngine(object):
     def kill_all_clusters(self):
         self.end_time = datetime.now()
         n_surviving_clusters = len(self.cluster_dict)
-        self.logger_status.info('{}: Killing all clusters'.format(datetime.now()))
+        self.logger_status.info('{}: Killing all remaining clusters'.format(datetime.now()))
         for cluster_id in sorted(self.cluster_dict):
             self.kill_cluster(cluster_id)
         self.logger_status.info('{}: All clusters have been killed'.format(datetime.now()))
         self.logger_status.info('{}: Multiple Cluster Engine shut down at {}'.format(
             datetime.now(), self.end_time))
-        self.logger_status.info(("{}: Processed {} files using {} surviving "
-            "clusters in {} minutes").format(datetime.now(), len(self.input_file_names), 
+        self.logger_status.info(("{}: Appears that {} files were successfully "
+            "processed using {} surviving clusters in {} minutes").format(
+            datetime.now(), len(self.input_file_names) - self.n_unsuccessful_files, 
             n_surviving_clusters, (self.end_time - self.start_time).seconds / 60.0))
         logging.shutdown()
         
@@ -175,6 +177,7 @@ class MultipleClusterEngine(object):
         self.load_balanced_view_dict.pop(cluster_id)
         self.cluster_dict.pop(cluster_id)
         self.async_results_dict.pop(cluster_id)
+        self.n_unsuccessful_files += 1
         
     def kill_cluster_if_ram_limit_exceeded(self): # only kills at max 1 cluster per method call
         if sum(self.cluster_RAM_use_dict.values()) > self.ram_limit_in_GB:
@@ -182,19 +185,14 @@ class MultipleClusterEngine(object):
                                  key=self.cluster_RAM_use_dict.get, reverse=True)[0]
             self.early_kill_cluster(cluster_id)
             self.cluster_indexes = itertools.cycle(sorted(self.load_balanced_view_dict))
-        assert len(self.load_balanced_view_dict) != 0, 'All clusters have been killed prematurely'
-        
-    def create_kwargs_dict_list(self, input_file_name, cluster_id, n_cpus):
-        function_kwargs_dict = copy.deepcopy(self.function_kwargs_dict)
-        function_kwargs_dict.update({'input_file_name': input_file_name,
-                                    'cluster_output_dir': self.cluster_output_dir,
-                                    'cluster_id': cluster_id,
-                                    'n_cpus': n_cpus})
-        function_kwargs_dict_list = []
-        for cpu_id in range(n_cpus):
-            function_kwargs_dict_list.append(copy.deepcopy(function_kwargs_dict))
-            function_kwargs_dict_list[cpu_id]['cpu_id'] = cpu_id
-        return function_kwargs_dict_list 
+        if len(self.load_balanced_view_dict) == 0:
+            self.logger_failure.info(("{}: All clusters have been killed prematurely "
+                "(probably due to exceeding RAM limit), so it would be a good idea"
+                " to determine which files, if any, successfully processed"
+                 ).format(datetime.now()))
+            self.logger_status.info(("{}: All clusters have been killed prematurely "
+                "(probably due to exceeding RAM limit)").format(datetime.now()))
+            raise Exception('All clusters have been killed prematurely')
     
     def check_if_function_in_cluster_failed(self, jth_cluster):
         if self.async_results_dict[jth_cluster] == []: # cluster just started, so it
@@ -206,8 +204,20 @@ class MultipleClusterEngine(object):
                     "file {}").format(datetime.now(), jth_cluster, exception.args[0], 
                     self.file_to_cluster_order_dict[jth_cluster][-1]))
                 self.async_results_dict[jth_cluster].pop()
-                #self.async_results_dict.pop(jth_cluster)
-                                     
+                self.n_unsuccessful_files += 1
+
+    def create_kwargs_dict_list(self, input_file_name, cluster_id, n_cpus):
+        function_kwargs_dict = copy.deepcopy(self.function_kwargs_dict)
+        function_kwargs_dict.update({'input_file_name': input_file_name,
+                                    'cluster_output_dir': self.cluster_output_dir,
+                                    'cluster_id': cluster_id,
+                                    'n_cpus': n_cpus})
+        function_kwargs_dict_list = []
+        for cpu_id in range(n_cpus):
+            function_kwargs_dict_list.append(copy.deepcopy(function_kwargs_dict))
+            function_kwargs_dict_list[cpu_id]['cpu_id'] = cpu_id
+        return function_kwargs_dict_list
+                
     def run_clusters(self):
         small_file_ctr = 1 # determine if you want to have queue or differently ordered queue
         big_file_ctr = 0
