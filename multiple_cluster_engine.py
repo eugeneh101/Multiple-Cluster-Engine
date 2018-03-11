@@ -272,7 +272,7 @@ class MultipleClusterEngine(object):
                 jth_cluster = next(self.cluster_indexes)                
                 if (not self.async_results_dict[jth_cluster][-1:]
                         or self.async_results_dict[jth_cluster][-1].done()): # check if cluster j is available                       
-                        self.clear_memory_on_cluster(jth_cluster)
+                    self.clear_memory_on_cluster(jth_cluster)
                     self.check_if_function_in_cluster_failed(jth_cluster) # check if previous file failed to process
                     if jth_cluster == 0: # send large files to large cluster (which ALWAYS has id == 0)
                         index = big_file_ctr
