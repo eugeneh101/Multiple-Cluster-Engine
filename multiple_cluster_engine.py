@@ -16,28 +16,29 @@ except: # Python 2 reload is a builtin
 
 class MultipleClusterEngine(object):
     def __init__(self, 
-                 cluster_job_name, 
-                 n_cpus_list, 
-                 ram_limit_in_GB,
-                 wait_time_in_seconds,
                  input_file_names,
                  output_parent_dir,
                  function_to_process,
-                 function_kwargs_dict): # always put function args in a dictionary
+                 function_kwargs_dict,
+                 cluster_job_name='MCE_job', 
+                 n_cpus_list=(6, 4, 4), 
+                 ram_limit_in_GB=20,
+                 wait_time_in_seconds=1
+                ): # always put function args in a dictionary
         reload(logging)
+        self.input_file_names = input_file_names
+        self.output_parent_dir = output_parent_dir
+        self.function_to_process = lambda kwargs: function_to_process(**kwargs)
+        self.function_kwargs_dict = function_kwargs_dict
         self.cluster_job_name = cluster_job_name
         self.n_cpus_list = n_cpus_list
         self.ram_limit_in_GB = ram_limit_in_GB
-        self.wait_time_in_seconds = wait_time_in_seconds
-        self.output_parent_dir = output_parent_dir
-        self.input_file_names = input_file_names
-        self.function_to_process = lambda kwargs: function_to_process(**kwargs)
-        self.function_kwargs_dict = function_kwargs_dict
+        self.wait_time_in_seconds = wait_time_in_seconds        
         
+        assert len(self.input_file_names) > 0, "Need input files"
+        assert os.path.isdir(self.output_parent_dir), "Output directory doesn't exist"
         assert cluster_job_name, "Needs cluster name"
         assert len(n_cpus_list) > 0, "Needs the number of CPUs per cluster"
-        assert os.path.isdir(self.output_parent_dir), "Output directory doesn't exist"
-        assert len(self.input_file_names) > 0, "Need input files"
 
         # used by engine
         self.cluster_dict = {}
